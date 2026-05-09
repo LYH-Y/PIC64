@@ -1,0 +1,8 @@
+7767517
+6 6
+Input            input                    0 1 input
+InnerProduct     fc1                      1 1 input h1 0=128 1=1 2=4352
+ReLU             relu1                    1 1 h1 r1
+InnerProduct     fc2                      1 1 r1 h2 0=64 1=1 2=8192
+ReLU             relu2                    1 1 h2 r2
+InnerProduct     fc3                      1 1 r2 output 0=4 1=1 2=256
