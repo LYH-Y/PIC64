@@ -1,0 +1,312 @@
+#include <onnxruntime_cxx_api.h>
+
+#include <algorithm>
+#include <chrono>
+#include <fstream>
+#include <iostream>
+#include <vector>
+
+int main(int argc, char* argv[])
+{
+    if (argc != 3) {
+        std::cerr << "Usage: "
+                  << argv[0]
+                  << " model.onnx input.bin\n";
+        return 1;
+    }
+
+    const char* model_path = argv[1];
+    const char* input_path = argv[2];
+
+    constexpr int H = 88;
+    constexpr int W = 88;
+
+    // ---------------------------------------------------------
+    // 1. 读取 PC 已经预处理好的 float32 Tensor
+    // ---------------------------------------------------------
+    std::ifstream ifs(
+        input_path,
+        std::ios::binary | std::ios::ate
+    );
+
+    if (!ifs) {
+        std::cerr << "Cannot open input: "
+                  << input_path << "\n";
+        return 1;
+    }
+
+    std::streamsize file_bytes = ifs.tellg();
+    ifs.seekg(0, std::ios::beg);
+
+    const size_t one_frame_elements = H * W;
+    const size_t one_frame_bytes =
+        one_frame_elements * sizeof(float);
+
+    if (file_bytes <= 0 ||
+        file_bytes % one_frame_bytes != 0)
+    {
+        std::cerr << "Invalid input size: "
+                  << file_bytes << " bytes\n";
+        return 1;
+    }
+
+    // 自动根据文件大小算 T
+    int64_t T =
+        static_cast<int64_t>(
+            file_bytes / one_frame_bytes
+        );
+
+    size_t input_count =
+        static_cast<size_t>(T) *
+        one_frame_elements;
+
+    std::vector<float> input_data(input_count);
+
+    if (!ifs.read(
+        reinterpret_cast<char*>(input_data.data()),
+        file_bytes))
+    {
+        std::cerr << "Read input failed\n";
+        return 1;
+    }
+
+    std::cout << "========================================\n";
+    std::cout << "Input file : " << input_path << "\n";
+    std::cout << "Bytes      : " << file_bytes << "\n";
+    std::cout << "Frames T   : " << T << "\n";
+    std::cout << "Input shape: [1,"
+              << T
+              << ",1,88,88]\n";
+    std::cout << "========================================\n";
+
+    // ---------------------------------------------------------
+    // 2. ORT 初始化
+    // ---------------------------------------------------------
+    Ort::Env env(
+        ORT_LOGGING_LEVEL_WARNING,
+        "vsr"
+    );
+
+    Ort::SessionOptions session_options;
+
+    session_options.SetIntraOpNumThreads(4);
+    session_options.SetInterOpNumThreads(1);
+
+    // 与之前正确性测试保持一致
+    session_options.SetGraphOptimizationLevel(
+        GraphOptimizationLevel::ORT_DISABLE_ALL
+    );
+
+    auto load_begin =
+        std::chrono::steady_clock::now();
+
+    Ort::Session session(
+        env,
+        model_path,
+        session_options
+    );
+
+    auto load_end =
+        std::chrono::steady_clock::now();
+
+    Ort::AllocatorWithDefaultOptions allocator;
+
+    auto input_name_alloc =
+        session.GetInputNameAllocated(
+            0,
+            allocator
+        );
+
+    auto output_name_alloc =
+        session.GetOutputNameAllocated(
+            0,
+            allocator
+        );
+
+    const char* input_name =
+        input_name_alloc.get();
+
+    const char* output_name =
+        output_name_alloc.get();
+
+    std::cout << "Input name : "
+              << input_name << "\n";
+
+    std::cout << "Output name: "
+              << output_name << "\n";
+
+    // ---------------------------------------------------------
+    // 3. Tensor [1,T,1,88,88]
+    // ---------------------------------------------------------
+    std::vector<int64_t> input_shape = {
+        1,
+        T,
+        1,
+        88,
+        88
+    };
+
+    Ort::MemoryInfo memory_info =
+        Ort::MemoryInfo::CreateCpu(
+            OrtArenaAllocator,
+            OrtMemTypeDefault
+        );
+
+    Ort::Value input_tensor =
+        Ort::Value::CreateTensor<float>(
+            memory_info,
+            input_data.data(),
+            input_data.size(),
+            input_shape.data(),
+            input_shape.size()
+        );
+
+    const char* input_names[] = {
+        input_name
+    };
+
+    const char* output_names[] = {
+        output_name
+    };
+
+    // ---------------------------------------------------------
+    // 4. 推理
+    // ---------------------------------------------------------
+    std::cout << "\nStart inference...\n";
+
+    auto infer_begin =
+        std::chrono::steady_clock::now();
+
+    auto output_tensors =
+        session.Run(
+            Ort::RunOptions{nullptr},
+            input_names,
+            &input_tensor,
+            1,
+            output_names,
+            1
+        );
+
+    auto infer_end =
+        std::chrono::steady_clock::now();
+
+    double load_ms =
+        std::chrono::duration<double, std::milli>(
+            load_end - load_begin
+        ).count();
+
+    double infer_ms =
+        std::chrono::duration<double, std::milli>(
+            infer_end - infer_begin
+        ).count();
+
+    // ---------------------------------------------------------
+    // 5. 获取输出
+    // ---------------------------------------------------------
+    auto output_info =
+        output_tensors[0]
+            .GetTensorTypeAndShapeInfo();
+
+    std::vector<int64_t> output_shape =
+        output_info.GetShape();
+
+    std::cout << "\nOutput shape: [";
+
+    for (size_t i = 0;
+         i < output_shape.size();
+         ++i)
+    {
+        if (i)
+            std::cout << ",";
+
+        std::cout << output_shape[i];
+    }
+
+    std::cout << "]\n";
+
+    if (output_shape.size() != 3) {
+        std::cerr << "Unexpected output shape\n";
+        return 1;
+    }
+
+    int64_t out_T = output_shape[1];
+    int64_t vocab = output_shape[2];
+
+    float* logits =
+        output_tensors[0]
+            .GetTensorMutableData<float>();
+
+    // ---------------------------------------------------------
+    // 6. 每个时间步 argmax
+    // ---------------------------------------------------------
+    std::vector<int> raw_ids;
+
+    for (int64_t t = 0; t < out_T; ++t)
+    {
+        float* row =
+            logits + t * vocab;
+
+        int best_id = 0;
+        float best_score = row[0];
+
+        for (int64_t j = 1;
+             j < vocab;
+             ++j)
+        {
+            if (row[j] > best_score)
+            {
+                best_score = row[j];
+                best_id = static_cast<int>(j);
+            }
+        }
+
+        raw_ids.push_back(best_id);
+    }
+
+    std::cout << "\nRaw argmax:\n";
+
+    for (int id : raw_ids)
+        std::cout << id << " ";
+
+    std::cout << "\n";
+
+    // ---------------------------------------------------------
+    // 7. CTC greedy decode
+    // blank = 0
+    // ---------------------------------------------------------
+    std::vector<int> decoded;
+
+    int previous = -1;
+
+    for (int id : raw_ids)
+    {
+        if (id != 0 &&
+            id != previous)
+        {
+            decoded.push_back(id);
+        }
+
+        previous = id;
+    }
+
+    std::cout << "\nCTC token IDs:\n";
+
+    for (int id : decoded)
+        std::cout << id << " ";
+
+    std::cout << "\n";
+
+    std::cout << "\nModel load : "
+              << load_ms
+              << " ms\n";
+
+    std::cout << "Inference  : "
+              << infer_ms
+              << " ms\n";
+
+    std::cout << "Equivalent : "
+              << infer_ms / static_cast<double>(T)
+              << " ms/frame\n";
+
+    return 0;
+}
